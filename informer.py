@@ -18,6 +18,9 @@ import numpy as np
 class EcgDataset(Dataset):
     def __init__(self,x,y)  :
         super().__init__()
+        #file_out = pd.read_csv(fileName)
+        #x = file_out.iloc[:,:-1].values
+        #y = file_out.iloc[:,-1:].values 
         self.X = torch.tensor(x)
         self.Y = torch.tensor(y)
     def __len__(self):
@@ -26,6 +29,7 @@ class EcgDataset(Dataset):
     def __getitem__(self, index): 
         return self.X[index].unsqueeze(1), self.Y[index] 
     
+
 class MyTestDataLoader():
     def __init__(self, batch_size) -> None:
         self.batch_size = batch_size 
@@ -162,47 +166,6 @@ class ClassificationHead(nn.Module):
       if self.details: print('in classification head after seq: '+ str(x.size())) 
       return x
 
-def probsparse_attention(query_states, key_states, value_states, sampling_factor=5):
-    """
-    Compute the probsparse self-attention.
-    Input shape: Batch x Time x Channel
-
-    Note the additional `sampling_factor` input.
-    """
-    # get input sizes with logs
-    L_K = key_states.size(1)
-    L_Q = query_states.size(1)
-    log_L_K = math.ceil(math.log1p(L_K))
-    log_L_Q = math.ceil(math.log1p(L_Q))
-
-    # calculate a subset of samples to slice from K and create Q_K_sample
-    U_part = min(sampling_factor * L_Q * log_L_K, L_K)
-
-    # create Q_K_sample (the q_i * k_j^T term in the sparsity measurement)
-    index_sample = torch.randint(0, L_K, (U_part,))
-    K_sample = key_states[:, index_sample, :]
-    Q_K_sample = torch.bmm(query_states, K_sample.transpose(1, 2))
-
-    # calculate the query sparsity measurement with Q_K_sample
-    M = Q_K_sample.max(dim=-1)[0] - torch.div(Q_K_sample.sum(dim=-1), L_K)
-
-    # calculate u to find the Top-u queries under the sparsity measurement
-    u = min(sampling_factor * log_L_Q, L_Q)
-    M_top = M.topk(u, sorted=False)[1]
-
-    # calculate Q_reduce as query_states[:, M_top]
-    dim_for_slice = torch.arange(query_states.size(0)).unsqueeze(-1)
-    Q_reduce = query_states[dim_for_slice, M_top]  # size: c*log_L_Q x channel
-
-    # and now, same as the canonical
-    d_k = query_states.size(-1)
-    attn_scores = torch.bmm(Q_reduce, key_states.transpose(-2, -1))  # Q_reduce x K^T
-    attn_scores = attn_scores / math.sqrt(d_k)
-    attn_probs = nn.functional.softmax(attn_scores, dim=-1)
-    attn_output = torch.bmm(attn_probs, value_states)
-
-    return attn_output, attn_scores
-
 class LayerNorm(nn.Module):
     def __init__(self, d_model, eps=1e-12):
         super(LayerNorm, self).__init__()
@@ -219,93 +182,195 @@ class LayerNorm(nn.Module):
         out = self.gamma * out + self.beta
         return out
 
+class ProbSparseAttention(nn.Module):
+  def __init__(self, d_model, sampling_factor=5):
+    super(ProbSparseAttention, self).__init__()
+    self.sampling_factor = sampling_factor
+
+  def forward(self, q, K, V):
+    L_K = K.size(1)
+    L_Q = q.size(1)
+    log_L_K = torch.ceil(torch.log1p(torch.tensor(L_K))).to(torch.int).item()
+    log_L_Q = torch.ceil(torch.log1p(torch.tensor(L_Q))).to(torch.int).item()
+
+    U_part = min(self.sampling_factor * L_Q * log_L_K, L_K)
+    index_sample = torch.randint(0, L_K, (U_part,))
+    K_sample = K[:, index_sample, :]
+
+    # Print shapes before bmm
+    print("q.shape:", q.shape)
+    print("K_sample.shape:", K_sample.shape)
+
+    # Add extra dimension to q to make it 4D
+   # q = q.unsqueeze(0)
+    Q_K_sample = torch.bmm(q.unsqueeze(0), K_sample.transpose(1, 2))
+    M = Q_K_sample.max(dim=-1)[0] - torch.div(Q_K_sample.sum(dim=-1), L_K)
+    u = min(self.sampling_factor * log_L_Q, L_Q)
+    M_top = M.topk(u, largest=False)[1]
+    dim_for_slice = torch.arange(q.size(0)).unsqueeze(-1)
+    Q_reduce = q[dim_for_slice, M_top]
+    d_k = q.size(-1)
+    attn_scores = torch.bmm(Q_reduce.unsqueeze(1), K.transpose(-2, -1))
+    attn_scores = attn_scores / math.sqrt(d_k)
+    attn_probs = nn.functional.softmax(attn_scores, dim=-1)
+    attn_output = torch.bmm(attn_probs, V)
+    return attn_output, attn_scores
+
+
+
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, d_model, n_head, sampling_factor, details):
+        super(MultiHeadAttention, self).__init__()
+        self.n_head = n_head
+        self.attention = ProbSparseAttention(d_model=d_model, sampling_factor=sampling_factor)
+        self.w_q = nn.Linear(d_model, d_model)
+        self.w_k = nn.Linear(d_model, d_model)
+        self.w_v = nn.Linear(d_model, d_model)
+        self.w_concat = nn.Linear(d_model, d_model)
+        self.details = details
+
+    def forward(self, q, k, v):
+        # Dot product with weight matrices
+        q, k, v = self.w_q(q), self.w_k(k), self.w_v(v)
+
+        if self.details:
+            print('in Multi Head Attention Q,K,V: ' + str(q.size()))
+
+        # Reshape query tensor
+        batch_size, query_len, d_model = q.size()
+        d_tensor = d_model // self.n_head
+        q = q.view(batch_size, self.n_head, query_len, d_tensor)
+
+        # Split tensor by number of heads
+        k, v = self.split(k), self.split(v)
+
+        if self.details:
+            print('in splitted Multi Head Attention Q,K,V: ' + str(q.size()))
+
+        # Scale dot product to compute similarity
+        out, attention = self.attention(q, k, v)
+
+        if self.details:
+            print('in Multi Head Attention, score value size: ' + str(out.size()))
+
+        # Concat and pass to linear layer
+        out = self.concat(out)
+        out = self.w_concat(out)
+
+        if self.details:
+            print('in Multi Head Attention, score value size after concat: ' + str(out.size()))
+        return out
+
+    def split(self, tensor):
+        batch_size, length, d_model = tensor.size()
+        d_tensor = d_model // self.n_head
+        tensor = tensor.view(batch_size, length, self.n_head, d_tensor).transpose(1, 2)
+        return tensor
+
+    def concat(self, tensor):
+        batch_size, head, length, d_tensor = tensor.size()
+        d_model = head * d_tensor
+        tensor = tensor.transpose(1, 2).contiguous().view(batch_size, length, d_model)
+        return tensor
+
+
 
 class EncoderLayer(nn.Module):
-    def __init__(self, d_model, ffn_hidden, drop_prob, details):
+
+    def __init__(self, d_model, ffn_hidden, n_head,sampling_factor, drop_prob,details):
         super(EncoderLayer, self).__init__()
+        self.attention = MultiHeadAttention(d_model=d_model, n_head=n_head,sampling_factor=sampling_factor, details=details)
         self.norm1 = LayerNorm(d_model=d_model)
         self.dropout1 = nn.Dropout(p=drop_prob)
-        self.ffn_hidden = ffn_hidden
+        self.details = details
         self.ffn = PositionwiseFeedForward(d_model=d_model, hidden=ffn_hidden, drop_prob=drop_prob)
         self.norm2 = LayerNorm(d_model=d_model)
         self.dropout2 = nn.Dropout(p=drop_prob)
-        self.details = details
 
     def forward(self, x):
-        # Print the dimensions of the input tensor
-        print("Input tensor dimensions:", x.size())
-
         # 1. compute self attention
-        attn_output, _ = probsparse_attention(x, x, x)  # Assuming self-attention is probsparse_attention
-        if self.details:
-            print('in encoder layer : ' + str(attn_output.size()))
+        _x = x
+        x = self.attention(q=x, k=x, v=x )
+        
+        if self.details: print('in encoder layer : '+ str(x.size()))
         # 2. add and norm
-        x = self.dropout1(attn_output)
-        x = self.norm1(x)
-        if self.details:
-            print('in encoder after norm layer : ' + str(x.size()))
+        x = self.dropout1(x)
+        x = self.norm1(x + _x)
+        
+        if self.details: print('in encoder after norm layer : '+ str(x.size()))
         # 3. positionwise feed forward network
-        x = self.ffn(x.transpose(1, 2)).transpose(1, 2)  # Ensure correct input size for PositionwiseFeedForward
-        if self.details:
-            print('in encoder after ffn : ' + str(x.size()))
+        _x = x
+        x = self.ffn(x)
+      
+        if self.details: print('in encoder after ffn : '+ str(x.size()))
         # 4. add and norm
         x = self.dropout2(x)
-        x = self.norm2(x)
+        x = self.norm2(x + _x)
         return x
 
 class Encoder(nn.Module):
 
-    def __init__(self, d_model, ffn_hidden,factor, n_layers, drop_prob,details, device):
+    def __init__(self, d_model, ffn_hidden, n_head, n_layers, drop_prob,details,sampling_factor, device):
         super().__init__()
-
         self.layers = nn.ModuleList([EncoderLayer(d_model=d_model,
                                                   ffn_hidden=ffn_hidden,
-                                                   details=details,
+                                                  n_head=n_head,
+                                                  sampling_factor=sampling_factor
+                                                  ,details=details,
                                                   drop_prob=drop_prob)
                                      for _ in range(n_layers)])
+
     def forward(self, x ): 
         for layer in self.layers:
             x = layer(x ) 
         return x
 
+
 class Informer(nn.Module):
-    def __init__(self, device, d_model=100, max_len=5000, seq_len=200, factor=5,
-                 ffn_hidden=128, n_layers=2, drop_prob=0.1, details=False):
-        super().__init__()
+
+    def __init__(self, device, d_model=100, n_head=4, max_len=5000, seq_len=200,
+                 ffn_hidden=128, n_layers=2, drop_prob=0.1, details=False, sampling_factor=5):
+        super().__init__() 
         self.device = device
-        self.details = details
-        self.encoder_input_layer = nn.Linear(in_features=1, out_features=d_model)
-        self.pos_emb = PostionalEncoding(max_seq_len=max_len, batch_first=False, d_model=d_model, dropout=0.1)
+        self.details = details 
+        self.encoder_input_layer = nn.Linear(   
+            in_features=1, 
+            out_features=d_model 
+            )
+   
+        self.pos_emb = PostionalEncoding(max_seq_len=max_len, batch_first=False, d_model=d_model, dropout=0.1) 
         self.encoder = Encoder(d_model=d_model,
-                               factor=factor,
-                               ffn_hidden=ffn_hidden,
+                               n_head=n_head, 
+                               ffn_hidden=ffn_hidden, 
                                drop_prob=drop_prob,
                                n_layers=n_layers,
                                details=details,
+                               sampling_factor=sampling_factor,  # Pass sampling_factor here
                                device=device)
         self.classHead = ClassificationHead(seq_len=seq_len, d_model=d_model, details=details, n_classes=6)
 
-    def forward(self, src):
-        if self.details:
-            print('before input layer: ' + str(src.size()))
+    def forward(self, src): 
+        if self.details: print('before input layer: ' + str(src.size()) )
         src = self.encoder_input_layer(src)
-        if self.details:
-            print('after input layer: ' + str(src.size()))
+        if self.details: print('after input layer: ' + str(src.size()) )
         src = self.pos_emb(src)
-        if self.details:
-            print('after pos_emb: ' + str(src.size()))
-        enc_src = self.encoder(src)
+        if self.details: print('after pos_emb: ' + str(src.size()) )
+        enc_src = self.encoder(src) 
         cls_res = self.classHead(enc_src)
-        if self.details:
-            print('after cls_res: ' + str(cls_res.size()))
+        if self.details: print('after cls_res: ' + str(cls_res.size()) )
         return cls_res
 
     
 def cross_entropy_loss(pred, target):
 
     criterion = nn.CrossEntropyLoss()
+    #print('pred : '+ str(pred ) + ' target size: '+ str(target.size()) + 'target: '+ str(target )+   ' target2: '+ str(target))
+    #print(  str(target.squeeze( -1)) )
     lossClass= criterion(pred, target ) 
+
     return lossClass
+
 
 def calc_loss_and_score(pred, target, metrics): 
     softmax = nn.Softmax(dim=1)
@@ -393,16 +458,15 @@ def train_model(dataloaders,model,optimizer, num_epochs=100):
 device = torch.device("cpu")
 sequence_len=8000 # sequence length of time series
 max_len=5000 # max time series sequence length 
-#n_head = 2 # number of attention head
+n_head = 2 # number of attention head
 n_layer = 1# number of encoder layer
 drop_prob = 0.1
-d_model = 45 # number of dimension (for positional embedding)
+d_model = 2 # number of dimension ( for positional embedding)
 ffn_hidden = 128 # size of hidden layer before classification 
 feature = 1 # for univariate time series (1d), it must be adjusted for 1. 
-batch_size = 5
-factor=5
+batch_size = 4
 
-model =  Informer(d_model=d_model,factor=factor, max_len=max_len, seq_len=sequence_len, ffn_hidden=ffn_hidden, n_layers=n_layer, drop_prob=drop_prob, details=False,device=device).to(device=device)
+model =  Informer(d_model=d_model, n_head=n_head, max_len=max_len, seq_len=sequence_len, ffn_hidden=ffn_hidden, n_layers=n_layer, drop_prob=drop_prob, details=False,device=device).to(device=device)
 
 optimizer = optim.Adam(model.parameters(), lr=0.001)
 print("loading data")
