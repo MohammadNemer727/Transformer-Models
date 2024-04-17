@@ -15,7 +15,7 @@ from torch import nn,optim
 # from torchinfo import summary 
 import numpy as np 
  
-class EcgDataset(Dataset):
+class Mydataset(Dataset):
     def __init__(self,x,y)  :
         super().__init__()
         #file_out = pd.read_csv(fileName)
@@ -29,20 +29,6 @@ class EcgDataset(Dataset):
     def __getitem__(self, index): 
         return self.X[index].unsqueeze(1), self.Y[index] 
     
-
-class MyTestDataLoader():
-    def __init__(self, batch_size) -> None:
-        self.batch_size = batch_size 
-        file_out_test = pd.read_csv('/content/drive/MyDrive/dataset/mitbih_train.csv')
-        
-        x_test = file_out_test.iloc[:,:-1].values
-        y_test = file_out_test.iloc[:,-1:].astype(dtype=int).values   
- 
-        test_set= EcgDataset(x= x_test, y= y_test) 
-        self.dataLoader= DataLoader(test_set, batch_size=self.batch_size, shuffle=True,  ) 
-
-    def getDataLoader(self): 
-        return self.dataLoader
 
 class myDataLoader():
     def __init__(self, batch_size) -> None:
@@ -103,9 +89,9 @@ class myDataLoader():
         print("train label ",y_train_encoded.shape)
         print("test data ",test_data.shape)
         print("test data ",y_test_encoded.shape)
-        train_set= EcgDataset(x= train_data, y= y_train_encoded) 
+        train_set= Mydataset(x= train_data, y= y_train_encoded) 
 
-        val_set= EcgDataset(x= test_data, y= y_test_encoded) 
+        val_set= Mydataset(x= test_data, y= y_test_encoded) 
 
         dataloaders = {
             'train': DataLoader(train_set, batch_size=batch_size, shuffle=True,  ),
