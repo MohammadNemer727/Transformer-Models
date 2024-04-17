@@ -14,56 +14,43 @@ import copy
 from torch import nn, optim
 from torch.nn.utils.rnn import pad_sequence
 from torchinfo import summary
-import torch.nn.functional as F 
+import torch.nn.functional as F
 from einops import rearrange
 
-class EcgDataset(Dataset):
+class MyDataset(Dataset):
     def __init__(self, x, y):
-        super().__init__()
-        self.X = torch.tensor(x)
-        self.Y = torch.tensor(y)
+        self.X = torch.tensor(x, dtype=torch.float32)
+        self.Y = torch.tensor(y, dtype=torch.long)
 
     def __len__(self):
         return len(self.Y)
 
     def __getitem__(self, index):
-        return self.X[index].unsqueeze(1), self.Y[index]
-
-class MyTestDataLoader:
-    def __init__(self, batch_size):
-        self.batch_size = batch_size
-        file_out_test = pd.read_csv('/content/drive/MyDrive/dataset/mitbih_train.csv')
-        x_test = file_out_test.iloc[:, :-1].values
-        y_test = file_out_test.iloc[:, -1:].astype(dtype=int).values
-        test_set = EcgDataset(x=x_test, y=y_test)
-        self.dataLoader = DataLoader(test_set, batch_size=self.batch_size, shuffle=True)
-
-    def getDataLoader(self):
-        return self.dataLoader
+        return self.X[index], self.Y[index]
 
 class myDataLoader:
     def __init__(self, batch_size):
         self.batch_size = batch_size
-        no_points = 1000
+        no_points = 100
         train_data = np.empty((0, no_points * 8), float)
         test_data = np.empty((0, no_points * 8), float)
         train_label = []
         test_label = []
 
-        folder_dir = './data/full'
+        folder_dir = '/content/drive/MyDrive/full'
         classes = os.listdir(folder_dir)
         train_counter = 0
 
         for class_name in classes:
             class_path = os.path.join(folder_dir, class_name)
             chosen_files = []
-            k = 2  # Number of files to choose randomly from each class
+            k = 2
             for _ in range(k):
                 csv_file = random.choice(os.listdir(class_path))
                 while csv_file in chosen_files:
                     csv_file = random.choice(os.listdir(class_path))
                 chosen_files.append(csv_file)
-                print("loading ", class_path, " ", csv_file)
+                print("loading ", os.path.join(class_path, csv_file))
                 try:
                     file_data = genfromtxt(os.path.join(class_path, csv_file), delimiter=',')
                     for i in range(0, len(file_data), no_points):
@@ -82,21 +69,19 @@ class myDataLoader:
         # Encoding labels
         label_encoder = LabelEncoder()
         y_train_encoded = label_encoder.fit_transform(train_label)
+        y_test_encoded = label_encoder.transform(test_label)
 
-        label_encoder = LabelEncoder()
-        y_test_encoded = label_encoder.fit_transform(test_label)
+        train_set = MyDataset(train_data, y_train_encoded)
+        val_set = MyDataset(test_data, y_test_encoded)
 
-        train_set = EcgDataset(x=train_data, y=y_train_encoded)
-        val_set = EcgDataset(x=test_data, y=y_test_encoded)
-
-        dataloaders = {
-            'train': DataLoader(train_set, batch_size=batch_size, shuffle=True),
-            'val': DataLoader(val_set, batch_size=batch_size, shuffle=True)
+        self.dataloaders = {
+            'train': DataLoader(train_set, batch_size=self.batch_size, shuffle=True),
+            'val': DataLoader(val_set, batch_size=self.batch_size, shuffle=True)
         }
-        self.dataloaders = dataloaders
 
     def getDataLoader(self):
         return self.dataloaders
+
 
 class PositionwiseFeedForward(nn.Module):
     def __init__(self, d_model, hidden, drop_prob=0.1):
@@ -195,7 +180,7 @@ class MultiHeadAttention(nn.Module):
         q, k, v = self.w_q(q), self.w_k(k), self.w_v(v)
         q, k, v = self.split(q), self.split(k), self.split(v)
         out, attention = self.attention(q, k, v)
-        
+
         out = self.concat(out)
         out = self.w_concat(out)
         return out
@@ -259,7 +244,7 @@ class ProbSparseSelfAttention(nn.Module):
         batch_size, seq_len, _ = x.size()
         q, k, v = self.qkv_proj(x).chunk(3, dim=-1)
         q, k, v = map(lambda t: rearrange(t, 'b s (h d) -> b h s d', h=self.n_head), (q, k, v))
-        print("Shapes: q={}, k={}, v={}".format(q.shape, k.shape, v.shape))  # Debugging statement
+        print("Shapes: q={}, k={}, v={}".format(q.shape, k.shape, v.shape))
         scores = torch.einsum('bhid,bhjd->bhij', q * self.scale, k)
         mask = torch.bernoulli(torch.ones((batch_size, self.n_head, seq_len), device=self.device) * 0.5).bool()
         scores.masked_fill_(~mask, -1e9)
@@ -272,17 +257,15 @@ class ProbSparseSelfAttention(nn.Module):
 
 
 class Informer(nn.Module):
-    def __init__(self, device, d_model=100, n_head=4, max_len=5000, seq_len=200, ffn_hidden=128, n_layer=2, drop_prob=0.1, details=False):
+    def __init__(self, d_model, n_head, seq_len, ffn_hidden, n_layers, drop_prob, details, device):
         super(Informer, self).__init__()
         self.device = device
-        self.encoder_input_layer = nn.Linear(sequence_len, d_model)
-        self.encoder = Encoder(d_model, ffn_hidden, n_head, n_layer, drop_prob, details, device)
-        self.classHead = ClassificationHead(seq_len, d_model, details)
-        
+        self.encoder_input_layer = nn.Linear(feature_dim, d_model)
+        self.encoder = Encoder(d_model, ffn_hidden, n_head, n_layers, drop_prob, details, device)
+        self.classHead = ClassificationHead(d_model, seq_len, details)
+
     def forward(self, src):
-        if src.dim() == 2:
-            src = src.unsqueeze(-1) 
-       
+        src = src.to(self.device)
         src = self.encoder_input_layer(src)
         enc_src = self.encoder(src)
         cls_res = self.classHead(enc_src)
@@ -363,18 +346,19 @@ def train_model(dataloaders, model, optimizer, num_epochs=100):
     return model
 
 device = torch.device("cpu")
-sequence_len = 2000
+sequence_len = 800
+batch_size = 32
+feature_dim = 800
 max_len = 5000
 n_head = 2
 n_layer = 1
 drop_prob = 0.1
-d_model = 128
-ffn_hidden = 128
-batch_size = 4
-
-model = Informer(device, d_model, n_head, max_len, sequence_len, ffn_hidden, n_layer, drop_prob, False).to(device)
+d_model = 32
+ffn_hidden = 32
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = Informer(d_model=128, n_head=2, seq_len=800, ffn_hidden=128, n_layers=1, drop_prob=0.1, details=False, device=device).to(device)
 optimizer = optim.Adam(model.parameters(), lr=0.001)
 
-dataloaders = myDataLoader(batch_size).getDataLoader()
+dataloaders = myDataLoader(batch_size=128).getDataLoader()
 model_normal_ce = train_model(dataloaders, model, optimizer, num_epochs=20)
 torch.save(model.state_dict(), 'informer')
